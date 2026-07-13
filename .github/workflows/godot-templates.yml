@@ -1,0 +1,456 @@
+name: Build encrypted Godot export templates
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      godot_tag:
+        description: "Godot tag，例如 4.7-stable；留空则自动检测最新 X.Y-stable"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: godot-encrypted-export-templates
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version_id: ${{ steps.release.outputs.version_id }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+
+    steps:
+      - name: 查找最新正式大版本
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.godot_tag || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${REQUESTED_TAG:-}" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(
+              gh api 'repos/godotengine/godot/releases?per_page=100' \
+                --jq '([.[]
+                  | select(
+                      .draft == false
+                      and .prerelease == false
+                      and (.tag_name | test("^[0-9]+[.][0-9]+([.][0-9]+)?-stable$"))
+                    )
+                ] | max_by(.published_at) | .tag_name) // empty'
+            )"
+          fi
+
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-stable$ ]]; then
+            echo "期望 X.Y-stable 标签，实际得到：$tag" >&2
+            exit 1
+          fi
+
+          upstream_tag="$(
+            gh api "repos/godotengine/godot/releases/tags/$tag" \
+              --jq 'select(.draft == false and .prerelease == false) | .tag_name'
+          )"
+          [[ "$upstream_tag" == "$tag" ]]
+
+          version_id="${tag%-stable}.stable"
+          release_tag="templates-$tag"
+          should_build=true
+
+          if is_draft="$(
+            gh release view "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft' 2>/dev/null
+          )"; then
+            if [[ "$is_draft" == "false" ]]; then
+              should_build=false
+            fi
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version_id=$version_id" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+
+    # 使用较老的 glibc，提高发行版兼容性。
+    container:
+      image: ubuntu:20.04
+
+    timeout-minutes: 240
+
+    env:
+      SCRIPT_AES256_ENCRYPTION_KEY: ${{ secrets.GODOT_PCK_KEY }}
+      GODOT_TAG: ${{ needs.detect.outputs.tag }}
+      VERSION_ID: ${{ needs.detect.outputs.version_id }}
+
+    steps:
+      - name: 安装 Linux 编译依赖
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates zip pkg-config \
+            libx11-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libasound2-dev libpulse-dev libudev-dev \
+            libxi-dev libxrandr-dev libwayland-dev
+
+      - name: 获取 Godot 源码
+        uses: actions/checkout@v7
+        with:
+          repository: godotengine/godot
+          ref: ${{ needs.detect.outputs.tag }}
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 安装 SCons 并检查密钥
+        shell: bash
+        run: |
+          python -m pip install 'scons>=4.4,<5'
+
+          if [[ ! "${SCRIPT_AES256_ENCRYPTION_KEY:-}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "GODOT_PCK_KEY 必须是64个十六进制字符。" >&2
+            exit 1
+          fi
+
+      - name: 编译 Linux x86_64 模板
+        shell: bash
+        run: |
+          scons --jobs=2 \
+            platform=linuxbsd \
+            target=template_debug \
+            arch=x86_64 \
+            debug_symbols=no
+
+          scons --jobs=2 \
+            platform=linuxbsd \
+            target=template_release \
+            arch=x86_64 \
+            debug_symbols=no
+
+          ./bin/godot.linuxbsd.template_release.x86_64 --version
+
+      - name: 打包 Linux 模板
+        shell: bash
+        run: |
+          mkdir -p stage dist
+
+          cp bin/godot.linuxbsd.template_debug.x86_64 \
+            stage/linux_debug.x86_64
+
+          cp bin/godot.linuxbsd.template_release.x86_64 \
+            stage/linux_release.x86_64
+
+          printf '%s\n' "$VERSION_ID" > stage/version.txt
+
+          (
+            cd stage
+            zip -9 -r "../dist/godot-${GODOT_TAG}-linux-x86_64.zip" .
+          )
+
+      - name: 上传 Linux 构建结果
+        uses: actions/upload-artifact@v7
+        with:
+          name: template-linux
+          path: dist/*.zip
+          if-no-files-found: error
+
+  windows:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 240
+
+    env:
+      SCRIPT_AES256_ENCRYPTION_KEY: ${{ secrets.GODOT_PCK_KEY }}
+      GODOT_TAG: ${{ needs.detect.outputs.tag }}
+      VERSION_ID: ${{ needs.detect.outputs.version_id }}
+
+    steps:
+      - name: 获取 Godot 源码
+        uses: actions/checkout@v7
+        with:
+          repository: godotengine/godot
+          ref: ${{ needs.detect.outputs.tag }}
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 安装 SCons 并检查密钥
+        shell: pwsh
+        run: |
+          python -m pip install 'scons>=4.4,<5'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if ($env:SCRIPT_AES256_ENCRYPTION_KEY -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw 'GODOT_PCK_KEY 必须是64个十六进制字符。'
+          }
+
+      - name: 安装 Windows 构建 SDK
+        shell: pwsh
+        run: |
+          python misc/scripts/install_d3d12_sdk_windows.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python misc/scripts/install_accesskit.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python misc/scripts/install_angle.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 编译 Windows x86_64 模板
+        shell: pwsh
+        run: |
+          scons --jobs=2 `
+            platform=windows `
+            target=template_debug `
+            arch=x86_64 `
+            debug_symbols=no
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          scons --jobs=2 `
+            platform=windows `
+            target=template_release `
+            arch=x86_64 `
+            debug_symbols=no
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & .\bin\godot.windows.template_release.x86_64.console.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 打包 Windows 模板
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage, dist | Out-Null
+
+          $files = @{
+            'godot.windows.template_debug.x86_64.exe' =
+              'windows_debug_x86_64.exe'
+
+            'godot.windows.template_debug.x86_64.console.exe' =
+              'windows_debug_x86_64_console.exe'
+
+            'godot.windows.template_release.x86_64.exe' =
+              'windows_release_x86_64.exe'
+
+            'godot.windows.template_release.x86_64.console.exe' =
+              'windows_release_x86_64_console.exe'
+          }
+
+          foreach ($item in $files.GetEnumerator()) {
+            Copy-Item `
+              (Join-Path bin $item.Key) `
+              (Join-Path stage $item.Value)
+          }
+
+          Set-Content `
+            -NoNewline `
+            -Path stage/version.txt `
+            -Value $env:VERSION_ID
+
+          Compress-Archive `
+            -CompressionLevel Optimal `
+            -Path stage/* `
+            -DestinationPath "dist/godot-$env:GODOT_TAG-windows-x86_64.zip"
+
+      - name: 上传 Windows 构建结果
+        uses: actions/upload-artifact@v7
+        with:
+          name: template-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  macos:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 300
+
+    env:
+      SCRIPT_AES256_ENCRYPTION_KEY: ${{ secrets.GODOT_PCK_KEY }}
+      GODOT_TAG: ${{ needs.detect.outputs.tag }}
+
+    steps:
+      - name: 获取 Godot 源码
+        uses: actions/checkout@v7
+        with:
+          repository: godotengine/godot
+          ref: ${{ needs.detect.outputs.tag }}
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 安装 SCons 并检查密钥
+        shell: bash
+        run: |
+          python -m pip install 'scons>=4.4,<5'
+
+          if [[ ! "${SCRIPT_AES256_ENCRYPTION_KEY:-}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "GODOT_PCK_KEY 必须是64个十六进制字符。" >&2
+            exit 1
+          fi
+
+      - name: 安装 macOS 构建 SDK
+        shell: bash
+        run: |
+          sh misc/scripts/install_vulkan_sdk_macos.sh
+          python misc/scripts/install_accesskit.py
+          python misc/scripts/install_angle.py
+
+      - name: 编译 Universal 2 macOS 模板
+        shell: bash
+        run: |
+          scons --jobs=3 \
+            platform=macos \
+            target=template_debug \
+            arch=arm64 \
+            debug_symbols=no
+
+          scons --jobs=3 \
+            platform=macos \
+            target=template_release \
+            arch=arm64 \
+            debug_symbols=no
+
+          scons --jobs=3 \
+            platform=macos \
+            target=template_debug \
+            arch=x86_64 \
+            debug_symbols=no
+
+          scons --jobs=3 \
+            platform=macos \
+            target=template_release \
+            arch=x86_64 \
+            debug_symbols=no \
+            generate_bundle=yes
+
+          test -f bin/godot_macos.zip
+          unzip -t bin/godot_macos.zip
+
+      - name: 打包 macOS 模板
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp bin/godot_macos.zip \
+            "dist/godot-${GODOT_TAG}-macos-universal.zip"
+
+      - name: 上传 macOS 构建结果
+        uses: actions/upload-artifact@v7
+        with:
+          name: template-macos
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - detect
+      - linux
+      - windows
+      - macos
+
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GODOT_TAG: ${{ needs.detect.outputs.tag }}
+      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+
+    steps:
+      - name: 下载三个平台包
+        uses: actions/download-artifact@v8
+        with:
+          pattern: template-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: 检查资产并生成 SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t assets < <(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              -name '*.zip' |
+            sort
+          )
+
+          if [[ "${#assets[@]}" -ne 3 ]]; then
+            printf '期望3个ZIP文件，实际找到%s个\n' \
+              "${#assets[@]}" >&2
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum *.zip > SHA256SUMS
+          )
+
+      - name: 创建 GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 如果上次上传中断并留下了草稿，则重新创建。
+          if is_draft="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft' 2>/dev/null
+          )" && [[ "$is_draft" == "true" ]]; then
+            gh release delete "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --yes \
+              --cleanup-tag
+          fi
+
+          cat > release-notes.md <<EOF
+          基于 Godot 官方标签 [$GODOT_TAG](https://github.com/godotengine/godot/releases/tag/$GODOT_TAG) 编译。
+
+          - Linux：x86_64 debug + release
+          - Windows：x86_64 debug + release，包含 console wrapper
+          - macOS：Universal 2，包含 x86_64 + arm64、debug + release
+          - PCK 密钥通过仓库 Secret 在编译时注入，不会打印或作为文件上传
+
+          这些是标准版模板，不包含 .NET/Mono。
+          EOF
+
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Encrypted Godot export templates $GODOT_TAG" \
+            --notes-file release-notes.md
