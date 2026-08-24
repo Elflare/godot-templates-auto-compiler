@@ -124,10 +124,10 @@ jobs:
           - Linux：x86_64 debug + release
           - Windows：x86_64 debug + release，包含 console wrapper
           - macOS：Universal 2，包含 x86_64 + arm64、debug + release
-          - 构建时禁用 3D 和摄像头模块
+          - 构建时保留 3D 支持，禁用摄像头模块
           - PCK 密钥通过仓库 Secret 在编译时注入，不会打印或作为文件上传
 
-          这些是禁用 3D 的非 .NET/Mono 模板。
+          这些是支持 2D HDR 后处理的非 .NET/Mono 模板。
           EOF
 
           gh release create "$RELEASE_TAG" \
@@ -204,7 +204,6 @@ jobs:
             platform=linuxbsd \
             target=template_debug \
             arch=x86_64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no
 
@@ -212,7 +211,6 @@ jobs:
             platform=linuxbsd \
             target=template_release \
             arch=x86_64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no
 
@@ -317,7 +315,6 @@ jobs:
             platform=windows `
             target=template_debug `
             arch=x86_64 `
-            disable_3d=yes `
             module_camera_enabled=no `
             debug_symbols=no
 
@@ -327,7 +324,6 @@ jobs:
             platform=windows `
             target=template_release `
             arch=x86_64 `
-            disable_3d=yes `
             module_camera_enabled=no `
             debug_symbols=no
 
@@ -444,7 +440,6 @@ jobs:
             platform=macos \
             target=template_debug \
             arch=arm64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no
 
@@ -452,7 +447,6 @@ jobs:
             platform=macos \
             target=template_release \
             arch=arm64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no
 
@@ -460,7 +454,6 @@ jobs:
             platform=macos \
             target=template_debug \
             arch=x86_64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no
 
@@ -468,7 +461,6 @@ jobs:
             platform=macos \
             target=template_release \
             arch=x86_64 \
-            disable_3d=yes \
             module_camera_enabled=no \
             debug_symbols=no \
             generate_bundle=yes
